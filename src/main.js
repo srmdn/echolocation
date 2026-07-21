@@ -1,13 +1,15 @@
 /**
- * Echolocation — Slice A + B + C
+ * Echolocation — Slice A + B + C + D1
  * A: move, walls, ping memory, void/exit, restart
  * B: energy + regen, score HUD, localStorage best depth, ping SFX
  * C: seeded procgen cave — new layout each run
+ * D1: sound-sensitive listeners — ping alerts, touch kills
  *
  * Vision rules:
  * - World is dark by default (map does NOT move/change mid-run).
  * - Space = sonar: paints nearby tiles into a fading memory buffer (costs energy).
  * - Bumping a wall briefly reveals that wall (contact echo).
+ * - Listeners hear pings in range; spam is dangerous.
  */
 
 // --- Tuning knobs ---
@@ -32,10 +34,21 @@ const MAP_W = 27;
 const MAP_H = 33;
 const GEN_ROOM_COUNT = 8;
 const GEN_VOID_COUNT = 5;
+const GEN_ENEMY_COUNT = 3;
 const GEN_MAX_ATTEMPTS = 24;
+
+// Slice D1 — listeners
+const ENEMY_RADIUS = 11;
+const ENEMY_HEAR_RADIUS = PING_RADIUS * 1.05;
+const ENEMY_SPEED_AGGRO = 58; // slower than player (165) — pressure, not instant death
+const ENEMY_CALM_SEC = 3.5;
+const ENEMY_REVEAL_FADE_SEC = 2.8;
+const ENEMY_MIN_SPAWN_DIST = 10; // tiles from player spawn
 
 const STORAGE_BEST_DEPTH = "echolocation_best_depth";
 const STORAGE_BEST_ESCAPE = "echolocation_best_escape_time";
+const STORAGE_INTRO_SEEN = "echolocation_intro_seen";
+const INTRO_PREVIEW_SEC = 5;
 
 // Tile codes
 const T_EMPTY = 0;
@@ -53,6 +66,8 @@ let memory = [];
 let spawnTile = { x: 1, y: 1 };
 let exitTile = { x: 1, y: 1 };
 let currentSeed = 0;
+/** @type {{ x: number, y: number }[]} world-pixel spawn points for listeners */
+let enemySpawns = [];
 
 /** Optional fixed seed from ?seed=123 — same map every restart while set */
 function parseUrlSeed() {
@@ -281,12 +296,14 @@ function tryGenerate(seed) {
   }
 
   let placed = 0;
+  const voidSet = new Set();
   for (const [x, y] of floors) {
     if (placed >= GEN_VOID_COUNT) break;
     const k = y * mapW + x;
     // Prefer off critical path; allow a few near path for tension
     if (critical.has(k) && rng() < 0.85) continue;
     grid[y][x] = T_VOID;
+    voidSet.add(k);
     placed++;
   }
 
@@ -295,6 +312,33 @@ function tryGenerate(seed) {
   if (!parents2) {
     // repair: clear voids on a recovered path attempt — fail gen instead
     return false;
+  }
+
+  // Place listeners on remaining floor (not void, not exit, far from spawn)
+  enemySpawns = [];
+  for (const [x, y] of floors) {
+    if (enemySpawns.length >= GEN_ENEMY_COUNT) break;
+    const k = y * mapW + x;
+    if (voidSet.has(k)) continue;
+    if (grid[y][x] !== T_EMPTY) continue;
+    if (x === exitTile.x && y === exitTile.y) continue;
+    const distSpawn = Math.abs(x - spawnTile.x) + Math.abs(y - spawnTile.y);
+    if (distSpawn < ENEMY_MIN_SPAWN_DIST) continue;
+    // Prefer mid/deep caves
+    if (y < spawnTile.y + 4 && rng() < 0.7) continue;
+    const c = tileCenter(x, y);
+    // Keep enemies apart
+    let tooClose = false;
+    for (const s of enemySpawns) {
+      const dx = s.x - c.x;
+      const dy = s.y - c.y;
+      if (dx * dx + dy * dy < (TILE_SIZE * 5) * (TILE_SIZE * 5)) {
+        tooClose = true;
+        break;
+      }
+    }
+    if (tooClose) continue;
+    enemySpawns.push({ x: c.x, y: c.y });
   }
 
   // Border always wall
@@ -337,6 +381,10 @@ function generateCave(seed) {
   exitTile = { x: mid, y: mapH - 3 };
   grid[spawnTile.y][spawnTile.x] = T_EMPTY;
   grid[exitTile.y][exitTile.x] = T_EXIT;
+  enemySpawns = [
+    tileCenter(mid, (mapH / 2) | 0),
+    tileCenter(mid - 1, ((mapH * 2) / 3) | 0),
+  ];
   currentSeed = s;
   return currentSeed;
 }
@@ -472,7 +520,50 @@ function pressed(k) {
 }
 
 // --- Game state ---
-const STATE = { RUN: "run", DEAD: "dead", ESCAPED: "escaped" };
+const STATE = {
+  PREVIEW: "preview", // first-open full map glance
+  RUN: "run",
+  DEAD: "dead",
+  ESCAPED: "escaped",
+};
+
+function hasSeenIntro() {
+  try {
+    return localStorage.getItem(STORAGE_INTRO_SEEN) === "1";
+  } catch {
+    return true;
+  }
+}
+
+function markIntroSeen() {
+  try {
+    localStorage.setItem(STORAGE_INTRO_SEEN, "1");
+  } catch {
+    /* ignore */
+  }
+}
+
+/** Light every tile + every listener (intro / debug) */
+function revealFullMap() {
+  for (let y = 0; y < mapH; y++) {
+    for (let x = 0; x < mapW; x++) {
+      memory[y][x] = 1;
+    }
+  }
+  if (run && run.enemies) {
+    for (const e of run.enemies) e.reveal = 1;
+  }
+}
+
+function beginNormalVision() {
+  clearMemory();
+  paintMemoryDisk(run.x, run.y, START_REVEAL_RADIUS, 0.9);
+  for (const e of run.enemies) {
+    e.reveal = 0;
+    e.state = "idle";
+    e.calm = 0;
+  }
+}
 
 function tileCenter(tx, ty) {
   return {
@@ -487,11 +578,23 @@ function clearMemory() {
   }
 }
 
-function createRun() {
+function createEnemies() {
+  return enemySpawns.map((s) => ({
+    x: s.x,
+    y: s.y,
+    state: "idle", // idle | aggro
+    calm: 0,
+    reveal: 0, // 0..1 sonar memory of this enemy
+  }));
+}
+
+function createRun(opts = {}) {
+  const preview = !!opts.preview;
   const c = tileCenter(spawnTile.x, spawnTile.y);
   clearMemory();
   return {
-    state: STATE.RUN,
+    state: preview ? STATE.PREVIEW : STATE.RUN,
+    previewLeft: preview ? INTRO_PREVIEW_SEC : 0,
     x: c.x,
     y: c.y,
     pingCd: 0,
@@ -506,6 +609,8 @@ function createRun() {
     newBestDepth: false,
     newBestEscape: false,
     seed: currentSeed,
+    enemies: createEnemies(),
+    deathReason: null, // "void" | "listener"
   };
 }
 
@@ -648,6 +753,7 @@ function doPing() {
   run.pings += 1;
 
   paintMemoryDisk(run.x, run.y, PING_RADIUS, 1);
+  revealAndAlertEnemies(run.x, run.y, PING_RADIUS, ENEMY_HEAR_RADIUS);
   playPingSfx(true);
 
   run.rings.push({
@@ -657,6 +763,63 @@ function doPing() {
     ttl: 0.4,
     radius: PING_RADIUS,
   });
+}
+
+/** Sonar lights enemies in vision radius; hearing radius may be slightly larger */
+function revealAndAlertEnemies(wx, wy, visionR, hearR) {
+  const v2 = visionR * visionR;
+  const h2 = hearR * hearR;
+  for (const e of run.enemies) {
+    const dx = e.x - wx;
+    const dy = e.y - wy;
+    const d2 = dx * dx + dy * dy;
+    if (d2 <= v2) {
+      e.reveal = 1;
+    }
+    if (d2 <= h2) {
+      e.state = "aggro";
+      e.calm = ENEMY_CALM_SEC;
+    }
+  }
+}
+
+function moveEntity(ent, dx, dy, radius) {
+  if (!circleHitsSolid(ent.x + dx, ent.y, radius)) ent.x += dx;
+  if (!circleHitsSolid(ent.x, ent.y + dy, radius)) ent.y += dy;
+}
+
+function updateEnemies(dt) {
+  for (const e of run.enemies) {
+    // Fade sonar memory of enemy body
+    if (e.reveal > 0) {
+      e.reveal = Math.max(0, e.reveal - dt / ENEMY_REVEAL_FADE_SEC);
+    }
+
+    if (e.state === "aggro") {
+      e.calm -= dt;
+      if (e.calm <= 0) {
+        e.state = "idle";
+      } else {
+        const dx = run.x - e.x;
+        const dy = run.y - e.y;
+        const len = Math.hypot(dx, dy) || 1;
+        const step = ENEMY_SPEED_AGGRO * dt;
+        moveEntity(e, (dx / len) * step, (dy / len) * step, ENEMY_RADIUS);
+        // Aggro silhouette slightly more visible
+        if (e.reveal < 0.35) e.reveal = 0.35;
+      }
+    }
+
+    // Touch kill
+    const pdx = e.x - run.x;
+    const pdy = e.y - run.y;
+    const hitR = ENEMY_RADIUS + PLAYER_RADIUS;
+    if (pdx * pdx + pdy * pdy < hitR * hitR) {
+      run.deathReason = "listener";
+      endRun(STATE.DEAD);
+      return;
+    }
+  }
 }
 
 function regenEnergy(dt) {
@@ -693,6 +856,7 @@ function updateDepth() {
 }
 
 function endRun(state) {
+  if (run.state !== STATE.RUN) return;
   run.state = state;
   run.newBestDepth = saveBestDepth(run.maxDepth);
   if (state === STATE.ESCAPED) {
@@ -703,6 +867,7 @@ function endRun(state) {
 function checkHazards() {
   const t = tileAtWorld(run.x, run.y);
   if (t === T_VOID) {
+    run.deathReason = "void";
     endRun(STATE.DEAD);
     return;
   }
@@ -714,11 +879,21 @@ function checkHazards() {
 function restart() {
   const seed = fixedSeed != null ? fixedSeed : randomSeed();
   generateCave(seed);
-  run = createRun();
-  paintMemoryDisk(run.x, run.y, START_REVEAL_RADIUS, 0.9);
+  // Every new cave: full layout glance, then darkness
+  run = createRun({ preview: true });
+  revealFullMap();
   view.x = run.x - view.w / 2;
   view.y = run.y - view.h / 2;
   clampCamera();
+}
+
+function finishIntroPreview() {
+  markIntroSeen();
+  beginNormalVision();
+  run.state = STATE.RUN;
+  run.previewLeft = 0;
+  run.time = 0;
+  run.rings = [];
 }
 
 function clampCamera() {
@@ -741,8 +916,32 @@ function framePressed(k) {
 function updateRun(dt) {
   beginFrameInput();
 
+  // Every new cave: full map + enemies, countdown, then drop into darkness
+  if (run.state === STATE.PREVIEW) {
+    if (framePressed("r")) {
+      restart();
+      return;
+    }
+    // Keep world fully lit during glance
+    revealFullMap();
+    run.previewLeft = Math.max(0, run.previewLeft - dt);
+
+    // Space skips remaining countdown
+    if (framePressed("Space") || run.previewLeft <= 0) {
+      finishIntroPreview();
+      return;
+    }
+    // Camera still frames spawn
+    const tx = run.x - view.w / 2;
+    const ty = run.y - view.h / 2;
+    view.x += (tx - view.x) * CAMERA_LERP;
+    view.y += (ty - view.y) * CAMERA_LERP;
+    clampCamera();
+    return;
+  }
+
   if (framePressed("r")) {
-    restart();
+    restart(); // new cave + full preview again
     return;
   }
 
@@ -766,6 +965,8 @@ function updateRun(dt) {
   }
 
   checkHazards();
+  if (run.state !== STATE.RUN) return;
+  updateEnemies(dt);
 
   const tx = run.x - view.w / 2;
   const ty = run.y - view.h / 2;
@@ -894,6 +1095,33 @@ function draw() {
     ctx.strokeRect(ex + 8.5, ey + 8.5, TILE_SIZE - 17, TILE_SIZE - 17);
   }
 
+  // Listeners (only when revealed / faintly when aggro)
+  for (const e of run.enemies) {
+    const a = e.reveal;
+    if (a <= 0.02) continue;
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, ENEMY_RADIUS, 0, Math.PI * 2);
+    if (e.state === "aggro") {
+      ctx.fillStyle = `rgba(220, 60, 90, ${0.35 + 0.45 * a})`;
+      ctx.strokeStyle = `rgba(255, 120, 140, ${0.5 + 0.4 * a})`;
+    } else {
+      ctx.fillStyle = `rgba(160, 90, 200, ${0.25 + 0.4 * a})`;
+      ctx.strokeStyle = `rgba(210, 150, 255, ${0.35 + 0.4 * a})`;
+    }
+    ctx.fill();
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // ear notches
+    ctx.beginPath();
+    ctx.arc(e.x - 5, e.y - 6, 3, 0, Math.PI * 2);
+    ctx.arc(e.x + 5, e.y - 6, 3, 0, Math.PI * 2);
+    ctx.fillStyle =
+      e.state === "aggro"
+        ? `rgba(255, 180, 190, ${0.6 * a})`
+        : `rgba(230, 200, 255, ${0.5 * a})`;
+    ctx.fill();
+  }
+
   // Player
   ctx.beginPath();
   ctx.arc(run.x, run.y, PLAYER_RADIUS, 0, Math.PI * 2);
@@ -908,7 +1136,43 @@ function draw() {
   ctx.restore();
 
   drawHud();
-  if (run.state !== STATE.RUN) drawSummary();
+  if (run.state === STATE.PREVIEW) drawPreviewOverlay();
+  if (run.state === STATE.DEAD || run.state === STATE.ESCAPED) drawSummary();
+}
+
+function drawPreviewOverlay() {
+  const w = view.w;
+  const h = view.h;
+  const sec = Math.max(1, Math.ceil(run.previewLeft));
+
+  // Soft vignette so map stays readable
+  ctx.fillStyle = "rgba(3, 4, 12, 0.28)";
+  ctx.fillRect(0, 0, w, h);
+
+  ctx.textAlign = "center";
+  const mono = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+
+  ctx.font = `bold 22px ${mono}`;
+  ctx.fillStyle = "rgba(230, 236, 245, 0.95)";
+  ctx.fillText("Memorize this cave", w / 2, h * 0.18);
+
+  ctx.font = `13px ${mono}`;
+  ctx.fillStyle = "rgba(170, 190, 210, 0.8)";
+  ctx.fillText(
+    "Walls · voids (X) · cyan exit · purple listeners",
+    w / 2,
+    h * 0.18 + 28
+  );
+
+  ctx.font = `bold 64px ${mono}`;
+  ctx.fillStyle = "rgba(120, 200, 255, 0.95)";
+  ctx.fillText(String(sec), w / 2, h * 0.5);
+
+  ctx.font = `14px ${mono}`;
+  ctx.fillStyle = "rgba(180, 195, 210, 0.75)";
+  ctx.fillText("Then the lights go out", w / 2, h * 0.5 + 40);
+  ctx.fillStyle = "rgba(150, 165, 185, 0.55)";
+  ctx.fillText("SPACE to skip", w / 2, h * 0.5 + 64);
 }
 
 function drawHud() {
@@ -949,10 +1213,14 @@ function drawHud() {
   ctx.textAlign = "center";
   ctx.font = `12px ${mono}`;
 
-  if (run.state === STATE.RUN && run.time < 12) {
+  if (run.state === STATE.PREVIEW) {
+    return; // overlay owns the chrome
+  }
+
+  if (run.state === STATE.RUN && run.time < 14) {
     ctx.fillStyle = "rgba(170, 190, 210, 0.45)";
     ctx.fillText(
-      "WASD move · SPACE sonar · R new cave",
+      "WASD move · SPACE sonar · R new cave — ping can wake listeners",
       view.w / 2,
       view.h - 14
     );
@@ -962,6 +1230,12 @@ function drawHud() {
   } else if (run.bumped && run.state === STATE.RUN) {
     ctx.fillStyle = "rgba(255, 170, 130, 0.7)";
     ctx.fillText("Wall contact", view.w / 2, view.h - 14);
+  } else if (
+    run.state === STATE.RUN &&
+    run.enemies.some((e) => e.state === "aggro")
+  ) {
+    ctx.fillStyle = "rgba(255, 100, 120, 0.75)";
+    ctx.fillText("Listener hunting — stay quiet or run", view.w / 2, view.h - 14);
   }
 }
 
@@ -976,7 +1250,11 @@ function drawSummary() {
 
   if (run.state === STATE.DEAD) {
     ctx.fillStyle = "#ff6b8a";
-    ctx.fillText("LOST IN THE DARK", w / 2, h / 2 - 56);
+    ctx.fillText(
+      run.deathReason === "listener" ? "CAUGHT BY A LISTENER" : "LOST IN THE DARK",
+      w / 2,
+      h / 2 - 56
+    );
   } else {
     ctx.fillStyle = "#5ee0e8";
     ctx.fillText("ESCAPED", w / 2, h / 2 - 56);
@@ -1029,6 +1307,7 @@ function frame(now) {
 }
 
 resize();
+// Each cave (including first load / R): full-map glance + countdown, then darkness
 restart();
 last = performance.now();
 requestAnimationFrame(frame);

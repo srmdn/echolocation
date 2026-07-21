@@ -23,7 +23,7 @@ Serve the project root with any static file server (ES modules do not load from 
 
 ## Status
 
-Playable **Slice A + B + C**: vision memory, energy loop, scores, and a **new seeded cave each run** (`R`).
+Playable **Slice A–D1**: vision memory, energy loop, seeded caves each run (`R`), and **listeners** that hunt when they hear your sonar.
 
 ## License
 
