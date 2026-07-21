@@ -1,10 +1,11 @@
 /**
- * Echolocation — Slice A
- * Move + walls + ping memory fade + void death + exit + R restart
+ * Echolocation — Slice A + B
+ * A: move, walls, ping memory, void/exit, restart
+ * B: energy + regen, score HUD, localStorage best depth, ping SFX
  *
  * Vision rules:
  * - World is dark by default (map does NOT move/change).
- * - Space = sonar: paints nearby tiles into a fading memory buffer.
+ * - Space = sonar: paints nearby tiles into a fading memory buffer (costs energy).
  * - Bumping a wall briefly reveals that wall (contact echo).
  */
 
@@ -12,14 +13,21 @@
 const TILE_SIZE = 40;
 const MOVE_SPEED = 165;
 const PLAYER_RADIUS = 9;
-const PING_RADIUS = 4.25 * TILE_SIZE; // ~4 tiles
-const PING_FADE_SEC = 3.2; // longer = less "walls keep changing"
-const MEMORY_FLOOR = 0.06; // residual ghost after fade (very dim)
+const PING_RADIUS = 4.25 * TILE_SIZE;
+const MEMORY_FLOOR = 0.06;
 const MEMORY_DECAY_TO_FLOOR_SEC = 3.2;
 const CONTACT_REVEAL = 0.85;
 const PING_COOLDOWN_SEC = 0.25;
 const CAMERA_LERP = 0.18;
 const START_REVEAL_RADIUS = 2.4 * TILE_SIZE;
+
+// Slice B — energy
+const ENERGY_MAX = 5;
+const PING_COST = 1;
+const ENERGY_REGEN_PER_S = 0.25; // 1 charge / 4s
+
+const STORAGE_BEST_DEPTH = "echolocation_best_depth";
+const STORAGE_BEST_ESCAPE = "echolocation_best_escape_time";
 
 // Tile codes
 const T_EMPTY = 0;
@@ -69,7 +77,7 @@ const CHAR_TO_TILE = {
 const mapH = MAP_ROWS.length;
 const mapW = MAP_ROWS[0].length;
 const grid = Array.from({ length: mapH }, () => Array(mapW).fill(T_EMPTY));
-/** @type {number[][]} vision memory 0..1 per tile (stable positions — map never moves) */
+/** @type {number[][]} vision memory 0..1 per tile */
 const memory = Array.from({ length: mapH }, () => Array(mapW).fill(0));
 let spawnTile = { x: 1, y: 1 };
 let exitTile = { x: mapW - 2, y: mapH - 2 };
@@ -84,10 +92,86 @@ for (let y = 0; y < mapH; y++) {
   }
 }
 
+// --- Persist ---
+function loadBestDepth() {
+  const n = Number(localStorage.getItem(STORAGE_BEST_DEPTH));
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+function loadBestEscapeTime() {
+  const n = Number(localStorage.getItem(STORAGE_BEST_ESCAPE));
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function saveBestDepth(depth) {
+  if (depth > meta.bestDepth) {
+    meta.bestDepth = depth;
+    localStorage.setItem(STORAGE_BEST_DEPTH, String(depth));
+    return true;
+  }
+  return false;
+}
+
+function saveBestEscape(time) {
+  if (meta.bestEscapeTime == null || time < meta.bestEscapeTime) {
+    meta.bestEscapeTime = time;
+    localStorage.setItem(STORAGE_BEST_ESCAPE, String(time));
+    return true;
+  }
+  return false;
+}
+
+const meta = {
+  bestDepth: loadBestDepth(),
+  bestEscapeTime: loadBestEscapeTime(),
+};
+
+// --- Audio (Web Audio, unlock on first input) ---
+let audioCtx = null;
+
+function ensureAudio() {
+  if (audioCtx) return audioCtx;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return null;
+  audioCtx = new AC();
+  return audioCtx;
+}
+
+function playPingSfx(ok) {
+  const ctxA = ensureAudio();
+  if (!ctxA) return;
+  if (ctxA.state === "suspended") ctxA.resume();
+
+  const t0 = ctxA.currentTime;
+  const osc = ctxA.createOscillator();
+  const gain = ctxA.createGain();
+  osc.connect(gain);
+  gain.connect(ctxA.destination);
+
+  if (ok) {
+    osc.type = "sine";
+    osc.frequency.setValueAtTime(520, t0);
+    osc.frequency.exponentialRampToValueAtTime(180, t0 + 0.18);
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(0.12, t0 + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.22);
+    osc.start(t0);
+    osc.stop(t0 + 0.24);
+  } else {
+    // dry click — no energy
+    osc.type = "triangle";
+    osc.frequency.setValueAtTime(90, t0);
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(0.06, t0 + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.08);
+    osc.start(t0);
+    osc.stop(t0 + 0.1);
+  }
+}
+
 // --- Canvas ---
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
-
 const view = { w: 0, h: 0, x: 0, y: 0 };
 
 function resize() {
@@ -108,6 +192,7 @@ const keys = new Set();
 const justPressed = new Set();
 
 window.addEventListener("keydown", (e) => {
+  ensureAudio();
   const k = normalizeKey(e.key);
   if (!k) return;
   if (
@@ -165,7 +250,11 @@ function createRun() {
     pings: 0,
     depth: 0,
     maxDepth: 0,
+    energy: ENERGY_MAX,
     bumped: false,
+    denyFlash: 0, // red energy flash timer
+    newBestDepth: false,
+    newBestEscape: false,
   };
 }
 
@@ -193,7 +282,6 @@ function isSolidTile(t) {
   return t === T_WALL;
 }
 
-/** Circle vs solid tiles; optionally collect contacted wall cells */
 function circleHitsSolid(cx, cy, r, contactOut) {
   const minTx = Math.floor((cx - r) / TILE_SIZE);
   const maxTx = Math.floor((cx + r) / TILE_SIZE);
@@ -238,7 +326,6 @@ function paintMemoryDisk(wx, wy, radius, strength) {
       const dy = cy - wy;
       const d2 = dx * dx + dy * dy;
       if (d2 > r2) continue;
-      // Soft edge: full strength in center, falloff near radius
       const fall = 1 - Math.sqrt(d2) / radius;
       const s = strength * (0.55 + 0.45 * fall);
       if (s > memory[ty][tx]) memory[ty][tx] = s;
@@ -297,10 +384,19 @@ function movePlayer(dt) {
 
 function doPing() {
   if (run.pingCd > 0) return;
+
+  if (run.energy < PING_COST) {
+    run.denyFlash = 0.35;
+    playPingSfx(false);
+    return;
+  }
+
+  run.energy -= PING_COST;
   run.pingCd = PING_COOLDOWN_SEC;
   run.pings += 1;
 
   paintMemoryDisk(run.x, run.y, PING_RADIUS, 1);
+  playPingSfx(true);
 
   run.rings.push({
     x: run.x,
@@ -311,8 +407,15 @@ function doPing() {
   });
 }
 
+function regenEnergy(dt) {
+  if (run.energy >= ENERGY_MAX) {
+    run.energy = ENERGY_MAX;
+    return;
+  }
+  run.energy = Math.min(ENERGY_MAX, run.energy + ENERGY_REGEN_PER_S * dt);
+}
+
 function decayMemory(dt) {
-  // Exponential-ish linear decay toward MEMORY_FLOOR, then slowly to 0
   const rate = dt / MEMORY_DECAY_TO_FLOOR_SEC;
   for (let y = 0; y < mapH; y++) {
     for (let x = 0; x < mapW; x++) {
@@ -322,7 +425,6 @@ function decayMemory(dt) {
         m -= rate * (1 - MEMORY_FLOOR);
         if (m < MEMORY_FLOOR) m = MEMORY_FLOOR;
       } else {
-        // residual ghost decays very slowly so layout feels stable, not flickering
         m -= dt * 0.02;
         if (m < 0) m = 0;
       }
@@ -338,20 +440,27 @@ function updateDepth() {
   if (d > run.maxDepth) run.maxDepth = d;
 }
 
+function endRun(state) {
+  run.state = state;
+  run.newBestDepth = saveBestDepth(run.maxDepth);
+  if (state === STATE.ESCAPED) {
+    run.newBestEscape = saveBestEscape(run.time);
+  }
+}
+
 function checkHazards() {
   const t = tileAtWorld(run.x, run.y);
   if (t === T_VOID) {
-    run.state = STATE.DEAD;
+    endRun(STATE.DEAD);
     return;
   }
   if (t === T_EXIT) {
-    run.state = STATE.ESCAPED;
+    endRun(STATE.ESCAPED);
   }
 }
 
 function restart() {
   run = createRun();
-  // Spawn room already "known" a bit so player isn't totally lost on boot
   paintMemoryDisk(run.x, run.y, START_REVEAL_RADIUS, 0.9);
   view.x = run.x - view.w / 2;
   view.y = run.y - view.h / 2;
@@ -387,14 +496,22 @@ function updateRun(dt) {
 
   run.time += dt;
   if (run.pingCd > 0) run.pingCd = Math.max(0, run.pingCd - dt);
+  if (run.denyFlash > 0) run.denyFlash = Math.max(0, run.denyFlash - dt);
 
   movePlayer(dt);
   if (framePressed("Space")) doPing();
 
+  regenEnergy(dt);
   decayMemory(dt);
   run.rings = run.rings.filter((r) => run.time - r.born < r.ttl);
 
   updateDepth();
+  // Live-update best depth mid-run so HUD stays honest
+  if (run.maxDepth > meta.bestDepth) {
+    saveBestDepth(run.maxDepth);
+    run.newBestDepth = true;
+  }
+
   checkHazards();
 
   const tx = run.x - view.w / 2;
@@ -411,7 +528,6 @@ function drawTile(tx, ty, t, a) {
   const y = ty * TILE_SIZE;
 
   if (t === T_EMPTY) {
-    // Soft floor so rooms feel solid, not only wall chunks popping
     ctx.fillStyle = `rgba(18, 22, 32, ${0.55 * a})`;
     ctx.fillRect(x, y, TILE_SIZE, TILE_SIZE);
     return;
@@ -444,6 +560,41 @@ function drawTile(tx, ty, t, a) {
   }
 }
 
+function drawEnergyPips(x, y) {
+  const pipW = 14;
+  const pipH = 10;
+  const gap = 4;
+  const full = Math.floor(run.energy);
+  const frac = run.energy - full;
+  const deny = run.denyFlash > 0;
+
+  ctx.fillStyle = deny
+    ? "rgba(255, 120, 140, 0.85)"
+    : "rgba(180, 200, 220, 0.55)";
+  ctx.font = "10px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+  ctx.textAlign = "left";
+  ctx.fillText("ENERGY", x, y - 5);
+
+  for (let i = 0; i < ENERGY_MAX; i++) {
+    const px = x + i * (pipW + gap);
+    ctx.strokeStyle = deny
+      ? "rgba(255, 90, 110, 0.9)"
+      : "rgba(140, 190, 255, 0.55)";
+    ctx.strokeRect(px + 0.5, y + 0.5, pipW - 1, pipH - 1);
+
+    let fill = 0;
+    if (i < full) fill = 1;
+    else if (i === full) fill = frac;
+
+    if (fill > 0.02) {
+      ctx.fillStyle = deny
+        ? `rgba(255, 90, 110, ${0.35 + 0.5 * fill})`
+        : `rgba(120, 190, 255, ${0.35 + 0.5 * fill})`;
+      ctx.fillRect(px + 1, y + 1, (pipW - 2) * fill, pipH - 2);
+    }
+  }
+}
+
 function draw() {
   const w = view.w;
   const h = view.h;
@@ -454,7 +605,6 @@ function draw() {
   ctx.save();
   ctx.translate(-Math.round(view.x), -Math.round(view.y));
 
-  // Only iterate visible tile range for perf
   const minTx = clamp(Math.floor(view.x / TILE_SIZE) - 1, 0, mapW - 1);
   const maxTx = clamp(Math.ceil((view.x + w) / TILE_SIZE) + 1, 0, mapW - 1);
   const minTy = clamp(Math.floor(view.y / TILE_SIZE) - 1, 0, mapH - 1);
@@ -468,7 +618,6 @@ function draw() {
     }
   }
 
-  // Ping rings (visual only)
   for (const ring of run.rings) {
     const age = run.time - ring.born;
     const u = age / ring.ttl;
@@ -481,7 +630,7 @@ function draw() {
     ctx.stroke();
   }
 
-  // Exit beacon always faintly visible
+  // Exit beacon
   {
     const ex = exitTile.x * TILE_SIZE;
     const ey = exitTile.y * TILE_SIZE;
@@ -510,35 +659,60 @@ function draw() {
 }
 
 function drawHud() {
-  ctx.textAlign = "left";
-  ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
-  ctx.fillStyle = "rgba(200, 210, 220, 0.55)";
-  ctx.fillText("WASD move · SPACE sonar · R restart", 16, 22);
+  const pad = 18;
+  const mono = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 
-  ctx.font = "14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
-  ctx.fillStyle = "rgba(210, 220, 230, 0.9)";
-  ctx.fillText(`Depth ${run.maxDepth}`, 16, 44);
+  // Top-right: run stats (ambition / record)
+  ctx.textAlign = "right";
+  ctx.font = `15px ${mono}`;
+  ctx.fillStyle = "rgba(220, 230, 240, 0.92)";
+  ctx.fillText(`Depth ${run.maxDepth}`, view.w - pad, pad + 14);
+
+  ctx.font = `12px ${mono}`;
+  ctx.fillStyle =
+    run.maxDepth >= meta.bestDepth && run.maxDepth > 0
+      ? "rgba(240, 215, 140, 0.85)"
+      : "rgba(150, 165, 185, 0.7)";
+  ctx.fillText(`Best ${meta.bestDepth}`, view.w - pad, pad + 34);
+
+  ctx.fillStyle = "rgba(140, 155, 175, 0.55)";
+  ctx.fillText(
+    `${run.time.toFixed(1)}s · ${run.pings} pings`,
+    view.w - pad,
+    pad + 52
+  );
+
+  // Bottom center: energy (action resource near SPACE) + feedback
+  const pipW = 14;
+  const gap = 4;
+  const energyBlockW = ENERGY_MAX * pipW + (ENERGY_MAX - 1) * gap;
+  const energyX = Math.round(view.w / 2 - energyBlockW / 2);
+  const energyY = view.h - 42;
+  drawEnergyPips(energyX, energyY);
+
+  ctx.textAlign = "center";
+  ctx.font = `12px ${mono}`;
 
   if (run.state === STATE.RUN && run.time < 12) {
-    ctx.fillStyle = "rgba(170, 190, 210, 0.55)";
-    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+    ctx.fillStyle = "rgba(170, 190, 210, 0.45)";
     ctx.fillText(
-      "Map stays fixed. SPACE only lights memory briefly — then it fades.",
-      16,
-      view.h - 36
+      "WASD move · SPACE sonar · R restart",
+      view.w / 2,
+      view.h - 14
     );
-    ctx.fillText("Bump a wall to feel/reveal it. Avoid X voids. Reach cyan exit.", 16, view.h - 18);
+  } else if (run.denyFlash > 0 && run.state === STATE.RUN) {
+    ctx.fillStyle = "rgba(255, 120, 140, 0.85)";
+    ctx.fillText("No energy — wait for regen", view.w / 2, view.h - 14);
   } else if (run.bumped && run.state === STATE.RUN) {
-    ctx.fillStyle = "rgba(255, 170, 130, 0.65)";
-    ctx.font = "12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
-    ctx.fillText("Wall contact — lit that wall for a moment.", 16, view.h - 18);
+    ctx.fillStyle = "rgba(255, 170, 130, 0.7)";
+    ctx.fillText("Wall contact", view.w / 2, view.h - 14);
   }
 }
 
 function drawSummary() {
   const w = view.w;
   const h = view.h;
-  ctx.fillStyle = "rgba(3, 4, 10, 0.75)";
+  ctx.fillStyle = "rgba(3, 4, 10, 0.78)";
   ctx.fillRect(0, 0, w, h);
 
   ctx.textAlign = "center";
@@ -546,18 +720,45 @@ function drawSummary() {
 
   if (run.state === STATE.DEAD) {
     ctx.fillStyle = "#ff6b8a";
-    ctx.fillText("LOST IN THE DARK", w / 2, h / 2 - 36);
+    ctx.fillText("LOST IN THE DARK", w / 2, h / 2 - 56);
   } else {
     ctx.fillStyle = "#5ee0e8";
-    ctx.fillText("ESCAPED", w / 2, h / 2 - 36);
+    ctx.fillText("ESCAPED", w / 2, h / 2 - 56);
   }
 
-  ctx.font = "14px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
-  ctx.fillStyle = "rgba(210, 220, 230, 0.9)";
-  ctx.fillText(`Depth ${run.maxDepth}`, w / 2, h / 2 + 4);
-  ctx.fillText(`Time ${run.time.toFixed(1)}s · Pings ${run.pings}`, w / 2, h / 2 + 28);
-  ctx.fillStyle = "rgba(180, 190, 200, 0.7)";
-  ctx.fillText("Press R to run again", w / 2, h / 2 + 64);
+  ctx.font = "15px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+  ctx.fillStyle = "rgba(210, 220, 230, 0.95)";
+  ctx.fillText(`Depth ${run.maxDepth}`, w / 2, h / 2 - 14);
+  ctx.fillText(
+    `Time ${run.time.toFixed(1)}s · Pings ${run.pings}`,
+    w / 2,
+    h / 2 + 10
+  );
+
+  ctx.font = "13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+  ctx.fillStyle = "rgba(160, 175, 195, 0.85)";
+  ctx.fillText(`Personal best depth: ${meta.bestDepth}`, w / 2, h / 2 + 36);
+
+  if (run.newBestDepth) {
+    ctx.fillStyle = "#f0d78c";
+    ctx.fillText("NEW BEST DEPTH", w / 2, h / 2 + 58);
+  } else if (run.state === STATE.ESCAPED && run.newBestEscape) {
+    ctx.fillStyle = "#8cf0c8";
+    ctx.fillText("NEW BEST ESCAPE TIME", w / 2, h / 2 + 58);
+  } else if (
+    run.state === STATE.ESCAPED &&
+    meta.bestEscapeTime != null
+  ) {
+    ctx.fillStyle = "rgba(140, 200, 180, 0.7)";
+    ctx.fillText(
+      `Best escape: ${meta.bestEscapeTime.toFixed(1)}s`,
+      w / 2,
+      h / 2 + 58
+    );
+  }
+
+  ctx.fillStyle = "rgba(180, 190, 200, 0.75)";
+  ctx.fillText("Press R to run again", w / 2, h / 2 + 92);
 }
 
 // --- Loop ---
@@ -573,6 +774,6 @@ function frame(now) {
 }
 
 resize();
-restart(); // also applies start memory + camera
+restart();
 last = performance.now();
 requestAnimationFrame(frame);
