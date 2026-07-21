@@ -1,10 +1,11 @@
 /**
- * Echolocation — Slice A + B
+ * Echolocation — Slice A + B + C
  * A: move, walls, ping memory, void/exit, restart
  * B: energy + regen, score HUD, localStorage best depth, ping SFX
+ * C: seeded procgen cave — new layout each run
  *
  * Vision rules:
- * - World is dark by default (map does NOT move/change).
+ * - World is dark by default (map does NOT move/change mid-run).
  * - Space = sonar: paints nearby tiles into a fading memory buffer (costs energy).
  * - Bumping a wall briefly reveals that wall (contact echo).
  */
@@ -26,6 +27,13 @@ const ENERGY_MAX = 5;
 const PING_COST = 1;
 const ENERGY_REGEN_PER_S = 0.25; // 1 charge / 4s
 
+// Slice C — procgen map size (includes solid border)
+const MAP_W = 27;
+const MAP_H = 33;
+const GEN_ROOM_COUNT = 8;
+const GEN_VOID_COUNT = 5;
+const GEN_MAX_ATTEMPTS = 24;
+
 const STORAGE_BEST_DEPTH = "echolocation_best_depth";
 const STORAGE_BEST_ESCAPE = "echolocation_best_escape_time";
 
@@ -34,62 +42,303 @@ const T_EMPTY = 0;
 const T_WALL = 1;
 const T_VOID = 2;
 const T_EXIT = 3;
-const T_SPAWN = 9;
 
-/**
- * Handcrafted cave — wider halls so first play is readable.
- * # wall  . floor  v void  E exit  S spawn
- */
-const MAP_ROWS = [
-  "####################",
-  "#S........#........#",
-  "#.........#........#",
-  "#....##...#...##...#",
-  "#....##...#...##...#",
-  "#.........#........#",
-  "####...#######...###",
-  "#........#.........#",
-  "#........#....v....#",
-  "#..##....#.........#",
-  "#..##....#####.....#",
-  "#..................#",
-  "#......######......#",
-  "#......#....#......#",
-  "#......#....#..v...#",
-  "#..................#",
-  "###..####..####..###",
-  "#..................#",
-  "#....v.............#",
-  "#..............E...#",
-  "####################",
-];
-
-const CHAR_TO_TILE = {
-  "#": T_WALL,
-  ".": T_EMPTY,
-  v: T_VOID,
-  E: T_EXIT,
-  S: T_SPAWN,
-  " ": T_EMPTY,
-};
-
-// --- Derived map ---
-const mapH = MAP_ROWS.length;
-const mapW = MAP_ROWS[0].length;
-const grid = Array.from({ length: mapH }, () => Array(mapW).fill(T_EMPTY));
-/** @type {number[][]} vision memory 0..1 per tile */
-const memory = Array.from({ length: mapH }, () => Array(mapW).fill(0));
+// --- Map state (filled by generator) ---
+let mapW = MAP_W;
+let mapH = MAP_H;
+/** @type {number[][]} */
+let grid = [];
+/** @type {number[][]} */
+let memory = [];
 let spawnTile = { x: 1, y: 1 };
-let exitTile = { x: mapW - 2, y: mapH - 2 };
+let exitTile = { x: 1, y: 1 };
+let currentSeed = 0;
 
-for (let y = 0; y < mapH; y++) {
-  const row = MAP_ROWS[y];
-  for (let x = 0; x < mapW; x++) {
-    const t = CHAR_TO_TILE[row[x]] ?? T_EMPTY;
-    grid[y][x] = t === T_SPAWN ? T_EMPTY : t;
-    if (t === T_SPAWN) spawnTile = { x, y };
-    if (t === T_EXIT) exitTile = { x, y };
+/** Optional fixed seed from ?seed=123 — same map every restart while set */
+function parseUrlSeed() {
+  try {
+    const raw = new URLSearchParams(window.location.search).get("seed");
+    if (raw == null || raw === "") return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return null;
+    return n >>> 0;
+  } catch {
+    return null;
   }
+}
+
+const fixedSeed = parseUrlSeed();
+
+function randomSeed() {
+  return (Math.random() * 0xffffffff) >>> 0;
+}
+
+/** Mulberry32 — deterministic [0,1) */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function rand() {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function randInt(rng, min, maxInclusive) {
+  return min + Math.floor(rng() * (maxInclusive - min + 1));
+}
+
+function inBounds(x, y) {
+  return x >= 0 && y >= 0 && x < mapW && y < mapH;
+}
+
+function carveRoom(x0, y0, w, h) {
+  const x1 = Math.min(mapW - 2, x0 + w - 1);
+  const y1 = Math.min(mapH - 2, y0 + h - 1);
+  const sx = Math.max(1, x0);
+  const sy = Math.max(1, y0);
+  for (let y = sy; y <= y1; y++) {
+    for (let x = sx; x <= x1; x++) {
+      grid[y][x] = T_EMPTY;
+    }
+  }
+  return {
+    x: sx,
+    y: sy,
+    w: x1 - sx + 1,
+    h: y1 - sy + 1,
+    cx: (sx + x1) >> 1,
+    cy: (sy + y1) >> 1,
+  };
+}
+
+function carveCorridor(x0, y0, x1, y1, rng) {
+  let x = x0;
+  let y = y0;
+  const horizFirst = rng() < 0.5;
+
+  const stepX = () => {
+    while (x !== x1) {
+      grid[y][x] = T_EMPTY;
+      // widen corridor by 1 occasionally for playability
+      if (y + 1 < mapH - 1) grid[y + 1][x] = T_EMPTY;
+      x += Math.sign(x1 - x);
+    }
+  };
+  const stepY = () => {
+    while (y !== y1) {
+      grid[y][x] = T_EMPTY;
+      if (x + 1 < mapW - 1) grid[y][x + 1] = T_EMPTY;
+      y += Math.sign(y1 - y);
+    }
+  };
+
+  if (horizFirst) {
+    stepX();
+    stepY();
+  } else {
+    stepY();
+    stepX();
+  }
+  grid[y1][x1] = T_EMPTY;
+}
+
+function walkable(t) {
+  return t === T_EMPTY || t === T_EXIT;
+}
+
+/** BFS on floor/exit; returns parent map or null if unreachable */
+function bfsParents(sx, sy) {
+  const key = (x, y) => y * mapW + x;
+  const parent = new Map();
+  const q = [[sx, sy]];
+  parent.set(key(sx, sy), null);
+
+  while (q.length) {
+    const [x, y] = q.shift();
+    if (x === exitTile.x && y === exitTile.y) return parent;
+    const nbs = [
+      [x + 1, y],
+      [x - 1, y],
+      [x, y + 1],
+      [x, y - 1],
+    ];
+    for (const [nx, ny] of nbs) {
+      if (!inBounds(nx, ny)) continue;
+      const k = key(nx, ny);
+      if (parent.has(k)) continue;
+      const t = grid[ny][nx];
+      if (!walkable(t) && !(nx === exitTile.x && ny === exitTile.y)) continue;
+      if (t === T_WALL || t === T_VOID) continue;
+      parent.set(k, [x, y]);
+      q.push([nx, ny]);
+    }
+  }
+  return null;
+}
+
+function pathCells(sx, sy, parents) {
+  const set = new Set();
+  const key = (x, y) => y * mapW + x;
+  let cur = [exitTile.x, exitTile.y];
+  while (cur) {
+    set.add(key(cur[0], cur[1]));
+    const p = parents.get(key(cur[0], cur[1]));
+    cur = p;
+  }
+  set.add(key(sx, sy));
+  return set;
+}
+
+function tryGenerate(seed) {
+  const rng = mulberry32(seed);
+  mapW = MAP_W;
+  mapH = MAP_H;
+  grid = Array.from({ length: mapH }, () => Array(mapW).fill(T_WALL));
+  memory = Array.from({ length: mapH }, () => Array(mapW).fill(0));
+
+  const rooms = [];
+  const bandH = Math.floor((mapH - 4) / GEN_ROOM_COUNT);
+
+  for (let i = 0; i < GEN_ROOM_COUNT; i++) {
+    const rw = randInt(rng, 4, 7);
+    const rh = randInt(rng, 3, 6);
+    const bandY0 = 2 + i * bandH;
+    const bandY1 = Math.min(mapH - 3, bandY0 + bandH - 1);
+    const maxY = Math.max(bandY0, bandY1 - rh);
+    const ry = randInt(rng, bandY0, Math.max(bandY0, maxY));
+    const rx = randInt(rng, 2, Math.max(2, mapW - 2 - rw));
+    rooms.push(carveRoom(rx, ry, rw, rh));
+  }
+
+  // Ensure rooms progress downward: sort by center y
+  rooms.sort((a, b) => a.cy - b.cy);
+
+  for (let i = 0; i < rooms.length - 1; i++) {
+    carveCorridor(rooms[i].cx, rooms[i].cy, rooms[i + 1].cx, rooms[i + 1].cy, rng);
+  }
+
+  // Extra side branches for variety (dead-ish rooms)
+  const branchCount = randInt(rng, 1, 3);
+  for (let b = 0; b < branchCount; b++) {
+    const base = rooms[randInt(rng, 1, rooms.length - 2)];
+    const rw = randInt(rng, 3, 5);
+    const rh = randInt(rng, 3, 5);
+    const rx = randInt(rng, 2, mapW - 2 - rw);
+    const ry = clamp(
+      base.y + randInt(rng, -2, 3),
+      2,
+      mapH - 2 - rh
+    );
+    const side = carveRoom(rx, ry, rw, rh);
+    carveCorridor(base.cx, base.cy, side.cx, side.cy, rng);
+  }
+
+  const start = rooms[0];
+  const end = rooms[rooms.length - 1];
+  spawnTile = { x: start.cx, y: start.cy };
+  exitTile = { x: end.cx, y: end.cy };
+  grid[spawnTile.y][spawnTile.x] = T_EMPTY;
+  grid[exitTile.y][exitTile.x] = T_EXIT;
+
+  // Clear small pad around spawn
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const x = spawnTile.x + dx;
+      const y = spawnTile.y + dy;
+      if (inBounds(x, y) && x > 0 && y > 0 && x < mapW - 1 && y < mapH - 1) {
+        if (grid[y][x] === T_WALL) grid[y][x] = T_EMPTY;
+      }
+    }
+  }
+  grid[exitTile.y][exitTile.x] = T_EXIT;
+
+  const parents = bfsParents(spawnTile.x, spawnTile.y);
+  if (!parents) return false;
+
+  const critical = pathCells(spawnTile.x, spawnTile.y, parents);
+
+  // Floor candidates for voids
+  const floors = [];
+  for (let y = 1; y < mapH - 1; y++) {
+    for (let x = 1; x < mapW - 1; x++) {
+      if (grid[y][x] !== T_EMPTY) continue;
+      if (x === spawnTile.x && y === spawnTile.y) continue;
+      const distSpawn =
+        Math.abs(x - spawnTile.x) + Math.abs(y - spawnTile.y);
+      if (distSpawn < 6) continue;
+      floors.push([x, y]);
+    }
+  }
+
+  // Shuffle floors
+  for (let i = floors.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    const tmp = floors[i];
+    floors[i] = floors[j];
+    floors[j] = tmp;
+  }
+
+  let placed = 0;
+  for (const [x, y] of floors) {
+    if (placed >= GEN_VOID_COUNT) break;
+    const k = y * mapW + x;
+    // Prefer off critical path; allow a few near path for tension
+    if (critical.has(k) && rng() < 0.85) continue;
+    grid[y][x] = T_VOID;
+    placed++;
+  }
+
+  // Re-check path still open (voids shouldn't block if we avoided critical)
+  const parents2 = bfsParents(spawnTile.x, spawnTile.y);
+  if (!parents2) {
+    // repair: clear voids on a recovered path attempt — fail gen instead
+    return false;
+  }
+
+  // Border always wall
+  for (let x = 0; x < mapW; x++) {
+    grid[0][x] = T_WALL;
+    grid[mapH - 1][x] = T_WALL;
+  }
+  for (let y = 0; y < mapH; y++) {
+    grid[y][0] = T_WALL;
+    grid[y][mapW - 1] = T_WALL;
+  }
+  grid[exitTile.y][exitTile.x] = T_EXIT;
+  grid[spawnTile.y][spawnTile.x] = T_EMPTY;
+
+  return true;
+}
+
+function generateCave(seed) {
+  let s = seed >>> 0;
+  for (let attempt = 0; attempt < GEN_MAX_ATTEMPTS; attempt++) {
+    const trySeed = (s + attempt * 9973) >>> 0;
+    if (tryGenerate(trySeed)) {
+      currentSeed = trySeed;
+      return currentSeed;
+    }
+  }
+  // Absolute fallback: simple open tunnel
+  mapW = MAP_W;
+  mapH = MAP_H;
+  grid = Array.from({ length: mapH }, () => Array(mapW).fill(T_WALL));
+  memory = Array.from({ length: mapH }, () => Array(mapW).fill(0));
+  const mid = (mapW / 2) | 0;
+  for (let y = 1; y < mapH - 1; y++) {
+    for (let dx = -2; dx <= 2; dx++) {
+      const x = mid + dx;
+      if (x > 0 && x < mapW - 1) grid[y][x] = T_EMPTY;
+    }
+  }
+  spawnTile = { x: mid, y: 2 };
+  exitTile = { x: mid, y: mapH - 3 };
+  grid[spawnTile.y][spawnTile.x] = T_EMPTY;
+  grid[exitTile.y][exitTile.x] = T_EXIT;
+  currentSeed = s;
+  return currentSeed;
 }
 
 // --- Persist ---
@@ -158,7 +407,6 @@ function playPingSfx(ok) {
     osc.start(t0);
     osc.stop(t0 + 0.24);
   } else {
-    // dry click — no energy
     osc.type = "triangle";
     osc.frequency.setValueAtTime(90, t0);
     gain.gain.setValueAtTime(0.0001, t0);
@@ -234,7 +482,9 @@ function tileCenter(tx, ty) {
 }
 
 function clearMemory() {
-  for (let y = 0; y < mapH; y++) memory[y].fill(0);
+  for (let y = 0; y < mapH; y++) {
+    if (memory[y]) memory[y].fill(0);
+  }
 }
 
 function createRun() {
@@ -252,13 +502,15 @@ function createRun() {
     maxDepth: 0,
     energy: ENERGY_MAX,
     bumped: false,
-    denyFlash: 0, // red energy flash timer
+    denyFlash: 0,
     newBestDepth: false,
     newBestEscape: false,
+    seed: currentSeed,
   };
 }
 
-let run = createRun();
+/** @type {ReturnType<typeof createRun>} */
+let run;
 
 function worldW() {
   return mapW * TILE_SIZE;
@@ -460,6 +712,8 @@ function checkHazards() {
 }
 
 function restart() {
+  const seed = fixedSeed != null ? fixedSeed : randomSeed();
+  generateCave(seed);
   run = createRun();
   paintMemoryDisk(run.x, run.y, START_REVEAL_RADIUS, 0.9);
   view.x = run.x - view.w / 2;
@@ -506,7 +760,6 @@ function updateRun(dt) {
   run.rings = run.rings.filter((r) => run.time - r.born < r.ttl);
 
   updateDepth();
-  // Live-update best depth mid-run so HUD stays honest
   if (run.maxDepth > meta.bestDepth) {
     saveBestDepth(run.maxDepth);
     run.newBestDepth = true;
@@ -662,7 +915,7 @@ function drawHud() {
   const pad = 18;
   const mono = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
 
-  // Top-right: run stats (ambition / record)
+  // Top-right: run stats
   ctx.textAlign = "right";
   ctx.font = `15px ${mono}`;
   ctx.fillStyle = "rgba(220, 230, 240, 0.92)";
@@ -682,7 +935,10 @@ function drawHud() {
     pad + 52
   );
 
-  // Bottom center: energy (action resource near SPACE) + feedback
+  ctx.fillStyle = "rgba(120, 140, 160, 0.45)";
+  ctx.fillText(`Seed ${run.seed}`, view.w - pad, pad + 70);
+
+  // Bottom center: energy
   const pipW = 14;
   const gap = 4;
   const energyBlockW = ENERGY_MAX * pipW + (ENERGY_MAX - 1) * gap;
@@ -696,7 +952,7 @@ function drawHud() {
   if (run.state === STATE.RUN && run.time < 12) {
     ctx.fillStyle = "rgba(170, 190, 210, 0.45)";
     ctx.fillText(
-      "WASD move · SPACE sonar · R restart",
+      "WASD move · SPACE sonar · R new cave",
       view.w / 2,
       view.h - 14
     );
@@ -738,27 +994,26 @@ function drawSummary() {
   ctx.font = "13px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
   ctx.fillStyle = "rgba(160, 175, 195, 0.85)";
   ctx.fillText(`Personal best depth: ${meta.bestDepth}`, w / 2, h / 2 + 36);
+  ctx.fillStyle = "rgba(130, 150, 170, 0.7)";
+  ctx.fillText(`Seed ${run.seed}`, w / 2, h / 2 + 56);
 
   if (run.newBestDepth) {
     ctx.fillStyle = "#f0d78c";
-    ctx.fillText("NEW BEST DEPTH", w / 2, h / 2 + 58);
+    ctx.fillText("NEW BEST DEPTH", w / 2, h / 2 + 78);
   } else if (run.state === STATE.ESCAPED && run.newBestEscape) {
     ctx.fillStyle = "#8cf0c8";
-    ctx.fillText("NEW BEST ESCAPE TIME", w / 2, h / 2 + 58);
-  } else if (
-    run.state === STATE.ESCAPED &&
-    meta.bestEscapeTime != null
-  ) {
+    ctx.fillText("NEW BEST ESCAPE TIME", w / 2, h / 2 + 78);
+  } else if (run.state === STATE.ESCAPED && meta.bestEscapeTime != null) {
     ctx.fillStyle = "rgba(140, 200, 180, 0.7)";
     ctx.fillText(
       `Best escape: ${meta.bestEscapeTime.toFixed(1)}s`,
       w / 2,
-      h / 2 + 58
+      h / 2 + 78
     );
   }
 
   ctx.fillStyle = "rgba(180, 190, 200, 0.75)";
-  ctx.fillText("Press R to run again", w / 2, h / 2 + 92);
+  ctx.fillText("Press R for a new cave", w / 2, h / 2 + 108);
 }
 
 // --- Loop ---

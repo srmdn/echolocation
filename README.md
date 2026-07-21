@@ -23,8 +23,7 @@ Serve the project root with any static file server (ES modules do not load from 
 
 ## Status
 
-Playable **Slice A + B**: handcrafted cave, vision memory, energy loop, scores.  
-Next (planned): procedural caves / seeds (Slice C).
+Playable **Slice A + B + C**: vision memory, energy loop, scores, and a **new seeded cave each run** (`R`).
 
 ## License
 
