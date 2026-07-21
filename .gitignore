@@ -7,6 +7,9 @@
 *secret*
 *credential*
 
+# Local-only notes / specs (never publish)
+.local/
+
 # Dependencies & build
 node_modules/
 dist/

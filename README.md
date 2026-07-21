@@ -2,15 +2,9 @@
 
 Dark-cave browser game. You are nearly blind — **sonar pings** briefly light walls and hazards, then fade. Manage energy, go deeper, escape or die, and beat your best depth.
 
-## Play (local)
+## Play
 
-ES modules need a tiny static server (not `file://`):
-
-```bash
-python3 -m http.server 8765
-```
-
-Open [http://127.0.0.1:8765/](http://127.0.0.1:8765/)
+Serve the project root with any static file server (ES modules do not load from `file://`), then open the site in a browser.
 
 ## Controls
 
