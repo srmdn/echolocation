@@ -483,9 +483,123 @@ function resize() {
 
 window.addEventListener("resize", resize);
 
-// --- Input ---
+// --- Input (keyboard + optional on-screen touch) ---
 const keys = new Set();
 const justPressed = new Set();
+
+/** @returns {boolean} */
+function isTouchPrimary() {
+  try {
+    return (
+      window.matchMedia("(pointer: coarse)").matches ||
+      (navigator.maxTouchPoints || 0) > 0
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Show virtual controls once touch is primary or after a touch interaction */
+let touchUiWanted = isTouchPrimary();
+
+const stick = {
+  active: false,
+  pointerId: null,
+  /** fixed base (CSS px) while held */
+  baseX: 0,
+  baseY: 0,
+  /** knob position */
+  x: 0,
+  y: 0,
+  /** normalized axes -1..1 */
+  nx: 0,
+  ny: 0,
+};
+
+/** @type {{ kind: 'ping' | 'restart', pointerId: number } | null} */
+let buttonHold = null;
+
+const TOUCH = {
+  stickR: 52,
+  stickMax: 40,
+  stickDead: 0.18,
+  btnR: 34,
+  restartR: 22,
+  pad: 18,
+};
+
+function safeInset(side) {
+  // CSS env() not readable from JS easily; approximate via visualViewport / fixed pad
+  return TOUCH.pad;
+}
+
+/** Layout hit targets in CSS pixels (screen space). */
+function touchLayout() {
+  const w = view.w;
+  const h = view.h;
+  const pad = safeInset("left");
+  const bottom = h - pad - 16;
+  return {
+    stickBaseX: pad + TOUCH.stickR + 8,
+    stickBaseY: bottom - TOUCH.stickR - 8,
+    pingX: w - pad - TOUCH.btnR - 8,
+    pingY: bottom - TOUCH.btnR - 8,
+    restartX: w - pad - TOUCH.btnR - 8,
+    restartY: bottom - TOUCH.btnR * 2 - TOUCH.restartR - 28,
+  };
+}
+
+function dist2(ax, ay, bx, by) {
+  const dx = ax - bx;
+  const dy = ay - by;
+  return dx * dx + dy * dy;
+}
+
+function canvasPoint(e) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: e.clientX - rect.left,
+    y: e.clientY - rect.top,
+  };
+}
+
+function setStickFromPoint(px, py) {
+  const dx = px - stick.baseX;
+  const dy = py - stick.baseY;
+  const len = Math.hypot(dx, dy);
+  const max = TOUCH.stickMax;
+  if (len > max && len > 0) {
+    stick.x = stick.baseX + (dx / len) * max;
+    stick.y = stick.baseY + (dy / len) * max;
+  } else {
+    stick.x = px;
+    stick.y = py;
+  }
+  const ux = (stick.x - stick.baseX) / max;
+  const uy = (stick.y - stick.baseY) / max;
+  const mag = Math.hypot(ux, uy);
+  if (mag < TOUCH.stickDead) {
+    stick.nx = 0;
+    stick.ny = 0;
+  } else {
+    const scale = Math.min(1, mag);
+    const inv = mag > 0 ? scale / mag : 0;
+    stick.nx = ux * inv;
+    stick.ny = uy * inv;
+  }
+}
+
+function clearStick() {
+  stick.active = false;
+  stick.pointerId = null;
+  stick.nx = 0;
+  stick.ny = 0;
+}
+
+/** One-frame synthetic key edge (touch buttons). Does not stick in `keys`. */
+function injectEdge(k) {
+  justPressed.add(k);
+}
 
 window.addEventListener("keydown", (e) => {
   ensureAudio();
@@ -509,6 +623,107 @@ window.addEventListener("keyup", (e) => {
   if (k) keys.delete(k);
 });
 
+/**
+ * @param {PointerEvent} e
+ */
+function onPointerDown(e) {
+  ensureAudio();
+  if (e.pointerType === "touch" || e.pointerType === "pen") {
+    touchUiWanted = true;
+  }
+  if (!touchUiWanted && e.pointerType === "mouse") {
+    // Desktop mouse: ignore virtual pad (keyboard owns play)
+    return;
+  }
+  // On touch-primary devices, mouse events may still fire after touch — allow both when UI on
+  if (!touchUiWanted) return;
+
+  if (e.cancelable) e.preventDefault();
+  const p = canvasPoint(e);
+  const lay = touchLayout();
+
+  // Restart button
+  if (dist2(p.x, p.y, lay.restartX, lay.restartY) <= TOUCH.restartR * TOUCH.restartR) {
+    injectEdge("r");
+    buttonHold = { kind: "restart", pointerId: e.pointerId };
+    try {
+      canvas.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+
+  // Ping / skip button (Space)
+  if (dist2(p.x, p.y, lay.pingX, lay.pingY) <= TOUCH.btnR * TOUCH.btnR) {
+    injectEdge("Space");
+    buttonHold = { kind: "ping", pointerId: e.pointerId };
+    try {
+      canvas.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+    return;
+  }
+
+  // Summary screens: tap anywhere → new cave
+  if (run && (run.state === STATE.DEAD || run.state === STATE.ESCAPED)) {
+    injectEdge("r");
+    return;
+  }
+
+  // Stick: left half of lower screen, or any free left-side drag while playing
+  const stickZone =
+    p.x < view.w * 0.55 && p.y > view.h * 0.35 && !stick.active;
+  if (stickZone || (!stick.active && p.x < view.w * 0.45)) {
+    stick.active = true;
+    stick.pointerId = e.pointerId;
+    stick.baseX = lay.stickBaseX;
+    stick.baseY = lay.stickBaseY;
+    setStickFromPoint(p.x, p.y);
+    try {
+      canvas.setPointerCapture(e.pointerId);
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/**
+ * @param {PointerEvent} e
+ */
+function onPointerMove(e) {
+  if (!stick.active || e.pointerId !== stick.pointerId) return;
+  if (e.cancelable) e.preventDefault();
+  const p = canvasPoint(e);
+  setStickFromPoint(p.x, p.y);
+}
+
+/**
+ * @param {PointerEvent} e
+ */
+function onPointerUp(e) {
+  if (buttonHold && buttonHold.pointerId === e.pointerId) {
+    buttonHold = null;
+  }
+  if (stick.active && e.pointerId === stick.pointerId) {
+    clearStick();
+  }
+}
+
+function onPointerCancel(e) {
+  onPointerUp(e);
+}
+
+canvas.addEventListener("pointerdown", onPointerDown, { passive: false });
+canvas.addEventListener("pointermove", onPointerMove, { passive: false });
+canvas.addEventListener("pointerup", onPointerUp);
+canvas.addEventListener("pointercancel", onPointerCancel);
+window.addEventListener("blur", () => {
+  clearStick();
+  buttonHold = null;
+});
+
 function normalizeKey(key) {
   if (key === " ") return "Space";
   if (key.length === 1) return key.toLowerCase();
@@ -517,6 +732,12 @@ function normalizeKey(key) {
 
 function pressed(k) {
   return keys.has(k);
+}
+
+/** Move axes from virtual stick (-1..1). */
+function stickAxes() {
+  if (!stick.active) return { x: 0, y: 0 };
+  return { x: stick.nx, y: stick.ny };
 }
 
 // --- Game state ---
@@ -705,7 +926,10 @@ function movePlayer(dt) {
   if (pressed("d") || pressed("ArrowRight")) ix += 1;
   if (pressed("w") || pressed("ArrowUp")) iy -= 1;
   if (pressed("s") || pressed("ArrowDown")) iy += 1;
-  if (ix === 0 && iy === 0) {
+  const sa = stickAxes();
+  ix += sa.x;
+  iy += sa.y;
+  if (Math.abs(ix) < 0.01 && Math.abs(iy) < 0.01) {
     run.bumped = false;
     return;
   }
@@ -1138,6 +1362,7 @@ function draw() {
   drawHud();
   if (run.state === STATE.PREVIEW) drawPreviewOverlay();
   if (run.state === STATE.DEAD || run.state === STATE.ESCAPED) drawSummary();
+  drawTouchControls();
 }
 
 function drawPreviewOverlay() {
@@ -1172,7 +1397,11 @@ function drawPreviewOverlay() {
   ctx.fillStyle = "rgba(180, 195, 210, 0.75)";
   ctx.fillText("Then the lights go out", w / 2, h * 0.5 + 40);
   ctx.fillStyle = "rgba(150, 165, 185, 0.55)";
-  ctx.fillText("SPACE to skip", w / 2, h * 0.5 + 64);
+  ctx.fillText(
+    touchUiWanted ? "TAP PING to skip" : "SPACE to skip",
+    w / 2,
+    h * 0.5 + 64
+  );
 }
 
 function drawHud() {
@@ -1202,12 +1431,12 @@ function drawHud() {
   ctx.fillStyle = "rgba(120, 140, 160, 0.45)";
   ctx.fillText(`Seed ${run.seed}`, view.w - pad, pad + 70);
 
-  // Bottom center: energy
+  // Bottom center: energy (raise when touch UI occupies bottom corners)
   const pipW = 14;
   const gap = 4;
   const energyBlockW = ENERGY_MAX * pipW + (ENERGY_MAX - 1) * gap;
   const energyX = Math.round(view.w / 2 - energyBlockW / 2);
-  const energyY = view.h - 42;
+  const energyY = touchUiWanted ? view.h - 118 : view.h - 42;
   drawEnergyPips(energyX, energyY);
 
   ctx.textAlign = "center";
@@ -1220,23 +1449,108 @@ function drawHud() {
   if (run.state === STATE.RUN && run.time < 14) {
     ctx.fillStyle = "rgba(170, 190, 210, 0.45)";
     ctx.fillText(
-      "WASD move · SPACE sonar · R new cave — ping can wake listeners",
+      touchUiWanted
+        ? "Stick move · PING sonar · R new cave — pings wake listeners"
+        : "WASD move · SPACE sonar · R new cave — ping can wake listeners",
       view.w / 2,
-      view.h - 14
+      touchUiWanted ? view.h - 92 : view.h - 14
     );
   } else if (run.denyFlash > 0 && run.state === STATE.RUN) {
     ctx.fillStyle = "rgba(255, 120, 140, 0.85)";
-    ctx.fillText("No energy — wait for regen", view.w / 2, view.h - 14);
+    ctx.fillText(
+      "No energy — wait for regen",
+      view.w / 2,
+      touchUiWanted ? view.h - 92 : view.h - 14
+    );
   } else if (run.bumped && run.state === STATE.RUN) {
     ctx.fillStyle = "rgba(255, 170, 130, 0.7)";
-    ctx.fillText("Wall contact", view.w / 2, view.h - 14);
+    ctx.fillText(
+      "Wall contact",
+      view.w / 2,
+      touchUiWanted ? view.h - 92 : view.h - 14
+    );
   } else if (
     run.state === STATE.RUN &&
     run.enemies.some((e) => e.state === "aggro")
   ) {
     ctx.fillStyle = "rgba(255, 100, 120, 0.75)";
-    ctx.fillText("Listener hunting — stay quiet or run", view.w / 2, view.h - 14);
+    ctx.fillText(
+      "Listener hunting — stay quiet or run",
+      view.w / 2,
+      touchUiWanted ? view.h - 92 : view.h - 14
+    );
   }
+}
+
+function drawTouchControls() {
+  if (!touchUiWanted || !run) return;
+  const lay = touchLayout();
+  const mono = "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+
+  // Virtual stick (left)
+  const bx = stick.active ? stick.baseX : lay.stickBaseX;
+  const by = stick.active ? stick.baseY : lay.stickBaseY;
+  const kx = stick.active ? stick.x : bx;
+  const ky = stick.active ? stick.y : by;
+
+  ctx.beginPath();
+  ctx.arc(bx, by, TOUCH.stickR, 0, Math.PI * 2);
+  ctx.fillStyle = stick.active
+    ? "rgba(40, 55, 80, 0.45)"
+    : "rgba(30, 40, 60, 0.35)";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(140, 190, 255, 0.35)";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.arc(kx, ky, 22, 0, Math.PI * 2);
+  ctx.fillStyle = stick.active
+    ? "rgba(160, 200, 255, 0.55)"
+    : "rgba(120, 150, 190, 0.4)";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(200, 220, 255, 0.5)";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // Ping button
+  const pingHeld = buttonHold && buttonHold.kind === "ping";
+  ctx.beginPath();
+  ctx.arc(lay.pingX, lay.pingY, TOUCH.btnR, 0, Math.PI * 2);
+  ctx.fillStyle = pingHeld
+    ? "rgba(80, 160, 220, 0.55)"
+    : "rgba(50, 100, 160, 0.4)";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(140, 210, 255, 0.65)";
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.font = `bold 11px ${mono}`;
+  ctx.fillStyle = "rgba(220, 235, 255, 0.9)";
+  const pingLabel =
+    run.state === STATE.PREVIEW
+      ? "SKIP"
+      : run.state === STATE.RUN
+        ? "PING"
+        : "PING";
+  ctx.fillText(pingLabel, lay.pingX, lay.pingY);
+
+  // Restart button
+  const rHeld = buttonHold && buttonHold.kind === "restart";
+  ctx.beginPath();
+  ctx.arc(lay.restartX, lay.restartY, TOUCH.restartR, 0, Math.PI * 2);
+  ctx.fillStyle = rHeld
+    ? "rgba(180, 100, 90, 0.5)"
+    : "rgba(90, 50, 50, 0.4)";
+  ctx.fill();
+  ctx.strokeStyle = "rgba(255, 150, 140, 0.55)";
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+  ctx.font = `bold 12px ${mono}`;
+  ctx.fillStyle = "rgba(255, 200, 190, 0.9)";
+  ctx.fillText("R", lay.restartX, lay.restartY);
+  ctx.textBaseline = "alphabetic";
 }
 
 function drawSummary() {
@@ -1291,7 +1605,11 @@ function drawSummary() {
   }
 
   ctx.fillStyle = "rgba(180, 190, 200, 0.75)";
-  ctx.fillText("Press R for a new cave", w / 2, h / 2 + 108);
+  ctx.fillText(
+    touchUiWanted ? "Tap R or anywhere for a new cave" : "Press R for a new cave",
+    w / 2,
+    h / 2 + 108
+  );
 }
 
 // --- Loop ---
