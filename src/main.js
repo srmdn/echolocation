@@ -12,6 +12,8 @@
  * - Listeners hear pings in range; spam is dangerous.
  */
 
+import { initOrientationPrompt, viewportSize } from "./mobile.js";
+
 // --- Tuning knobs ---
 const TILE_SIZE = 40;
 const MOVE_SPEED = 165;
@@ -469,11 +471,11 @@ function playPingSfx(ok) {
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
 const view = { w: 0, h: 0, x: 0, y: 0 };
+initOrientationPrompt({ game: "Echolocation", accent: "#8cd8ff" });
 
 function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const w = window.innerWidth;
-  const h = window.innerHeight;
+  const { w, h } = viewportSize();
   canvas.width = Math.floor(w * dpr);
   canvas.height = Math.floor(h * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -482,6 +484,13 @@ function resize() {
 }
 
 window.addEventListener("resize", resize);
+window.addEventListener("orientationchange", () => {
+  requestAnimationFrame(resize);
+  window.setTimeout(resize, 80);
+});
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", resize, { passive: true });
+}
 
 // --- Input (keyboard + optional on-screen touch) ---
 const keys = new Set();
@@ -524,13 +533,16 @@ const TOUCH = {
   stickMax: 40,
   stickDead: 0.18,
   btnR: 34,
-  restartR: 22,
+  restartR: 28,
   pad: 18,
 };
 
 function safeInset(side) {
-  // CSS env() not readable from JS easily; approximate via visualViewport / fixed pad
-  return TOUCH.pad;
+  // CSS env() is not readable from JS; keep a viewport-aware safety margin.
+  return Math.max(
+    TOUCH.pad,
+    Math.min(30, Math.floor(Math.min(view.w, view.h) * 0.05))
+  );
 }
 
 /** Layout hit targets in CSS pixels (screen space). */
@@ -1384,7 +1396,9 @@ function drawPreviewOverlay() {
   ctx.font = `13px ${mono}`;
   ctx.fillStyle = "rgba(170, 190, 210, 0.8)";
   ctx.fillText(
-    "Walls · voids (X) · cyan exit · purple listeners",
+    w < 480
+      ? "Walls · voids · exit · listeners"
+      : "Walls · voids (X) · cyan exit · purple listeners",
     w / 2,
     h * 0.18 + 28
   );
@@ -1450,7 +1464,9 @@ function drawHud() {
     ctx.fillStyle = "rgba(170, 190, 210, 0.45)";
     ctx.fillText(
       touchUiWanted
-        ? "Stick move · PING sonar · R new cave — pings wake listeners"
+        ? view.w < 460
+          ? "Stick · PING · R new cave"
+          : "Stick move · PING sonar · R new cave — pings wake listeners"
         : "WASD move · SPACE sonar · R new cave — ping can wake listeners",
       view.w / 2,
       touchUiWanted ? view.h - 92 : view.h - 14
@@ -1560,7 +1576,7 @@ function drawSummary() {
   ctx.fillRect(0, 0, w, h);
 
   ctx.textAlign = "center";
-  ctx.font = "bold 28px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+  ctx.font = `${w < 460 ? "bold 20px" : "bold 28px"} ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`;
 
   if (run.state === STATE.DEAD) {
     ctx.fillStyle = "#ff6b8a";
