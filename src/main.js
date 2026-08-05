@@ -427,6 +427,8 @@ const meta = {
 
 // --- Audio (Web Audio, unlock on first input) ---
 let audioCtx = null;
+let audioMaster = null;
+let audioCompressor = null;
 
 function ensureAudio() {
   if (audioCtx) return audioCtx;
@@ -434,6 +436,24 @@ function ensureAudio() {
   if (!AC) return null;
   audioCtx = new AC();
   return audioCtx;
+}
+
+function audioOutput(ctxA) {
+  if (audioMaster) return audioMaster;
+
+  audioMaster = ctxA.createGain();
+  audioMaster.gain.value = 1;
+
+  audioCompressor = ctxA.createDynamicsCompressor();
+  audioCompressor.threshold.value = -12;
+  audioCompressor.knee.value = 6;
+  audioCompressor.ratio.value = 6;
+  audioCompressor.attack.value = 0.003;
+  audioCompressor.release.value = 0.12;
+
+  audioMaster.connect(audioCompressor);
+  audioCompressor.connect(ctxA.destination);
+  return audioMaster;
 }
 
 function playPingSfx(ok) {
@@ -445,14 +465,14 @@ function playPingSfx(ok) {
   const osc = ctxA.createOscillator();
   const gain = ctxA.createGain();
   osc.connect(gain);
-  gain.connect(ctxA.destination);
+  gain.connect(audioOutput(ctxA));
 
   if (ok) {
     osc.type = "sine";
     osc.frequency.setValueAtTime(520, t0);
     osc.frequency.exponentialRampToValueAtTime(180, t0 + 0.18);
     gain.gain.setValueAtTime(0.0001, t0);
-    gain.gain.exponentialRampToValueAtTime(0.12, t0 + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.28, t0 + 0.01);
     gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.22);
     osc.start(t0);
     osc.stop(t0 + 0.24);
@@ -460,7 +480,7 @@ function playPingSfx(ok) {
     osc.type = "triangle";
     osc.frequency.setValueAtTime(90, t0);
     gain.gain.setValueAtTime(0.0001, t0);
-    gain.gain.exponentialRampToValueAtTime(0.06, t0 + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.16, t0 + 0.005);
     gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.08);
     osc.start(t0);
     osc.stop(t0 + 0.1);

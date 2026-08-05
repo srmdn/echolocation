@@ -9,7 +9,7 @@ Rules for automated assistants working in this repository.
 
 ## Stack (summary)
 
-Browser game: HTML, Canvas 2D, vanilla JavaScript. No build step and no new dependencies unless the maintainer approves.
+Browser game: HTML, Canvas 2D, vanilla JavaScript. esbuild is a development-only production build tool; no runtime dependencies.
 
 ## Do
 
