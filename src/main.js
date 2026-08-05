@@ -12,6 +12,8 @@
  * - Listeners hear pings in range; spam is dangerous.
  */
 
+import { initOrientationPrompt, viewportSize } from "./mobile.js";
+
 // --- Tuning knobs ---
 const TILE_SIZE = 40;
 const MOVE_SPEED = 165;
@@ -425,6 +427,8 @@ const meta = {
 
 // --- Audio (Web Audio, unlock on first input) ---
 let audioCtx = null;
+let audioMaster = null;
+let audioCompressor = null;
 
 function ensureAudio() {
   if (audioCtx) return audioCtx;
@@ -432,6 +436,24 @@ function ensureAudio() {
   if (!AC) return null;
   audioCtx = new AC();
   return audioCtx;
+}
+
+function audioOutput(ctxA) {
+  if (audioMaster) return audioMaster;
+
+  audioMaster = ctxA.createGain();
+  audioMaster.gain.value = 1;
+
+  audioCompressor = ctxA.createDynamicsCompressor();
+  audioCompressor.threshold.value = -12;
+  audioCompressor.knee.value = 6;
+  audioCompressor.ratio.value = 6;
+  audioCompressor.attack.value = 0.003;
+  audioCompressor.release.value = 0.12;
+
+  audioMaster.connect(audioCompressor);
+  audioCompressor.connect(ctxA.destination);
+  return audioMaster;
 }
 
 function playPingSfx(ok) {
@@ -443,14 +465,14 @@ function playPingSfx(ok) {
   const osc = ctxA.createOscillator();
   const gain = ctxA.createGain();
   osc.connect(gain);
-  gain.connect(ctxA.destination);
+  gain.connect(audioOutput(ctxA));
 
   if (ok) {
     osc.type = "sine";
     osc.frequency.setValueAtTime(520, t0);
     osc.frequency.exponentialRampToValueAtTime(180, t0 + 0.18);
     gain.gain.setValueAtTime(0.0001, t0);
-    gain.gain.exponentialRampToValueAtTime(0.12, t0 + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.28, t0 + 0.01);
     gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.22);
     osc.start(t0);
     osc.stop(t0 + 0.24);
@@ -458,7 +480,7 @@ function playPingSfx(ok) {
     osc.type = "triangle";
     osc.frequency.setValueAtTime(90, t0);
     gain.gain.setValueAtTime(0.0001, t0);
-    gain.gain.exponentialRampToValueAtTime(0.06, t0 + 0.005);
+    gain.gain.exponentialRampToValueAtTime(0.16, t0 + 0.005);
     gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.08);
     osc.start(t0);
     osc.stop(t0 + 0.1);
@@ -469,11 +491,11 @@ function playPingSfx(ok) {
 const canvas = document.getElementById("game");
 const ctx = canvas.getContext("2d");
 const view = { w: 0, h: 0, x: 0, y: 0 };
+initOrientationPrompt({ game: "Echolocation", accent: "#8cd8ff" });
 
 function resize() {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const w = window.innerWidth;
-  const h = window.innerHeight;
+  const { w, h } = viewportSize();
   canvas.width = Math.floor(w * dpr);
   canvas.height = Math.floor(h * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -482,6 +504,13 @@ function resize() {
 }
 
 window.addEventListener("resize", resize);
+window.addEventListener("orientationchange", () => {
+  requestAnimationFrame(resize);
+  window.setTimeout(resize, 80);
+});
+if (window.visualViewport) {
+  window.visualViewport.addEventListener("resize", resize, { passive: true });
+}
 
 // --- Input (keyboard + optional on-screen touch) ---
 const keys = new Set();
@@ -524,13 +553,16 @@ const TOUCH = {
   stickMax: 40,
   stickDead: 0.18,
   btnR: 34,
-  restartR: 22,
+  restartR: 28,
   pad: 18,
 };
 
 function safeInset(side) {
-  // CSS env() not readable from JS easily; approximate via visualViewport / fixed pad
-  return TOUCH.pad;
+  // CSS env() is not readable from JS; keep a viewport-aware safety margin.
+  return Math.max(
+    TOUCH.pad,
+    Math.min(30, Math.floor(Math.min(view.w, view.h) * 0.05))
+  );
 }
 
 /** Layout hit targets in CSS pixels (screen space). */
@@ -1384,7 +1416,9 @@ function drawPreviewOverlay() {
   ctx.font = `13px ${mono}`;
   ctx.fillStyle = "rgba(170, 190, 210, 0.8)";
   ctx.fillText(
-    "Walls · voids (X) · cyan exit · purple listeners",
+    w < 480
+      ? "Walls · voids · exit · listeners"
+      : "Walls · voids (X) · cyan exit · purple listeners",
     w / 2,
     h * 0.18 + 28
   );
@@ -1450,7 +1484,9 @@ function drawHud() {
     ctx.fillStyle = "rgba(170, 190, 210, 0.45)";
     ctx.fillText(
       touchUiWanted
-        ? "Stick move · PING sonar · R new cave — pings wake listeners"
+        ? view.w < 460
+          ? "Stick · PING · R new cave"
+          : "Stick move · PING sonar · R new cave — pings wake listeners"
         : "WASD move · SPACE sonar · R new cave — ping can wake listeners",
       view.w / 2,
       touchUiWanted ? view.h - 92 : view.h - 14
@@ -1560,7 +1596,7 @@ function drawSummary() {
   ctx.fillRect(0, 0, w, h);
 
   ctx.textAlign = "center";
-  ctx.font = "bold 28px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace";
+  ctx.font = `${w < 460 ? "bold 20px" : "bold 28px"} ui-monospace, SFMono-Regular, Menlo, Consolas, monospace`;
 
   if (run.state === STATE.DEAD) {
     ctx.fillStyle = "#ff6b8a";

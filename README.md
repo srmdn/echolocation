@@ -4,7 +4,20 @@ Dark-cave browser game. You are nearly blind — **sonar pings** briefly light w
 
 ## Play
 
-Serve the project root with any static file server (ES modules do not load from `file://`), then open the site in a browser.
+For source development, serve the project root with any static file server (ES modules do not load from `file://`), then open the site in a browser.
+
+```bash
+# source preview
+python3 -m http.server 8765
+```
+
+For a production bundle:
+
+```bash
+npm install
+npm run build
+python3 -m http.server 8765 --directory dist
+```
 
 ## Controls
 
@@ -17,7 +30,7 @@ Serve the project root with any static file server (ES modules do not load from 
 ## Stack
 
 - HTML + Canvas 2D + vanilla JavaScript
-- No build step, no dependencies
+- esbuild development dependency for the production bundle; no runtime dependencies
 - `localStorage` for personal bests
 - Web Audio for ping SFX
 
